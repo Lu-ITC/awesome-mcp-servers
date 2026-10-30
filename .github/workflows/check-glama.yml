@@ -23,14 +23,14 @@ jobs:
             const pr_number = context.payload.pull_request.number;
             const marker = '<!-- welcome-comment -->';
 
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
               issue_number: pr_number,
               per_page: 100,
             });
 
-            if (!comments.some(c => c.body.includes(marker))) {
+            if (!comments.some(c => c.user && c.user.login === 'github-actions[bot]' && (c.body || '').includes(marker))) {
               await github.rest.issues.createComment({
                 owner,
                 repo,
@@ -60,22 +60,95 @@ jobs:
             const fs = require('fs');
             const { owner, repo } = context.repo;
             const pr_number = context.payload.pull_request.number;
+            const BOT_LOGIN = 'github-actions[bot]';
 
-            // Read existing README to check for duplicates
-            const readme = fs.readFileSync('README.md', 'utf8');
-            const existingUrls = new Set();
-            const urlRegex = /\(https:\/\/github\.com\/[^)]+\)/gi;
-            for (const match of readme.matchAll(urlRegex)) {
-              existingUrls.add(match[0].toLowerCase());
+            // Labels are advisory and do not replace manual review.
+            // Strict allowlists. Only values that pass these are ever interpolated into comments.
+            const SEG = '[A-Za-z0-9_.-]+';
+            const README_FILE_RE = /^README(-[A-Za-z_]+)?\.md$/;
+            const GITHUB_REPO_URL_RE = new RegExp(`^https://github\\.com/(${SEG})/(${SEG})((?:/(?:tree|blob)/${SEG}(?:/${SEG})*)?)/?$`);
+            const ENTRY_NAME_RE = new RegExp(`^@?${SEG}(?:/${SEG})+$`);
+            const GLAMA_SERVER_URL_RE = new RegExp(`^https://glama\\.ai/mcp/servers/(@?${SEG})/(${SEG})$`);
+            const GLAMA_BADGE_URL_RE = new RegExp(`^https://glama\\.ai/mcp/servers/(@?${SEG})/(${SEG})/badges/score\\.svg$`);
+            const ENTRY_RE = /^\s*[-*+]\s+\[([^\]]+)\]\(([^)\s]+)\)(.*)$/;
+            const BADGE_RE = /\[!\[[^\]]*\]\(([^)\s]+)\)\]\(([^)\s]+)\)/g;
+            const LINK_TARGET_RE = /\]\(\s*([^)\s]*)/g;
+            const LINK_LIKE_RE = /\]\(|https?:\/\/|<[a-z!/]/i;
+
+            const isDotSegment = s => /^\.+$/.test(s);
+
+            // Dedupe key: lowercased owner/repo plus any sub-path, ignoring the /tree/<ref> part,
+            // query strings, fragments, trailing slashes and a .git suffix.
+            function githubKey(path) {
+              const segs = path.split(/[?#]/)[0].split('/').filter(Boolean);
+              if (segs.length < 2) return null;
+              const ownerRepo = [segs[0], segs[1].replace(/\.git$/i, '')];
+              const rest = (segs[2] === 'tree' || segs[2] === 'blob') ? segs.slice(4) : segs.slice(2);
+              return [...ownerRepo, ...rest].join('/').toLowerCase();
             }
 
-            // Get the PR diff
-            const { data: files } = await github.rest.pulls.listFiles({
+            function parseGithubRepoUrl(url) {
+              const m = url.match(GITHUB_REPO_URL_RE);
+              if (!m || isDotSegment(m[1]) || isDotSegment(m[2])) return null;
+              const subPath = m[3].split('/').filter(Boolean);
+              if (subPath.some(isDotSegment)) return null;
+              return {
+                owner: m[1],
+                repo: m[2],
+                url: `https://github.com/${m[1]}/${m[2]}${m[3]}`,
+                key: githubKey(`${m[1]}/${m[2]}${m[3]}`),
+              };
+            }
+
+            function parseGlamaBadge(imgUrl, hrefUrl) {
+              const img = imgUrl.match(GLAMA_BADGE_URL_RE);
+              const href = hrefUrl.match(GLAMA_SERVER_URL_RE);
+              if (!img || !href) return null;
+              const path = `${img[1]}/${img[2]}`;
+              if (path !== `${href[1]}/${href[2]}`) return null;
+              const glamaOwner = img[1].replace(/^@/, '');
+              if (isDotSegment(glamaOwner) || isDotSegment(img[2])) return null;
+              return { path, ownerRepo: `${glamaOwner}/${img[2]}` };
+            }
+
+            // For displaying values that failed validation: strip backticks/control chars and
+            // render inside a fenced code block, where markdown, HTML and @mentions are inert.
+            function codeBlock(values) {
+              const lines = values.map(v => String(v).replace(/[\u0000-\u001f\u007f`]/g, '').slice(0, 200));
+              return '```text\n' + lines.join('\n') + '\n```';
+            }
+
+            // Existing entries across every README variant in the base branch
+            const existingKeys = new Set();
+            for (const readmeFile of fs.readdirSync('.').filter(f => README_FILE_RE.test(f))) {
+              const content = fs.readFileSync(readmeFile, 'utf8');
+              for (const match of content.matchAll(/\]\(\s*https:\/\/github\.com\/([^)\s]+)/gi)) {
+                const key = githubKey(match[1]);
+                if (key) existingKeys.add(key);
+              }
+            }
+
+            // Get the full PR diff
+            const files = await github.paginate(github.rest.pulls.listFiles, {
               owner,
               repo,
               pull_number: pr_number,
               per_page: 100,
             });
+
+            const manualReviewReasons = [];
+            const expectedFileCount = context.payload.pull_request.changed_files;
+            if (files.length >= 3000 || (typeof expectedFileCount === 'number' && files.length < expectedFileCount)) {
+              manualReviewReasons.push('Not all changed files could be retrieved from the GitHub API.');
+            }
+            const unexpectedFiles = files.filter(f => !README_FILE_RE.test(f.filename)).map(f => f.filename);
+            if (unexpectedFiles.length > 0) {
+              manualReviewReasons.push('The PR changes files other than the README files.');
+            }
+            const filesWithoutPatch = files.filter(f => README_FILE_RE.test(f.filename) && !f.patch && f.changes !== 0).map(f => f.filename);
+            if (filesWithoutPatch.length > 0) {
+              manualReviewReasons.push('The diff of some README files is too large to be inspected automatically.');
+            }
 
             // Permitted emojis
             const permittedEmojis = [
@@ -95,119 +168,95 @@ jobs:
               '\u{1FA9F}',        // 🪟 Windows
               '\u{1F427}',        // 🐧 Linux
             ];
+            const emojiRegex = /\p{Emoji_Presentation}|\p{Emoji}\uFE0F/gu;
 
-            // All added lines with GitHub links (includes stale diff noise)
-            const addedLines = files
-              .filter(f => f.patch)
-              .flatMap(f => f.patch.split('\n').filter(line => line.startsWith('+')))
-              .filter(line => line.includes('](https://github.com/'));
+            // Structurally parse every added README line
+            const entries = [];
+            let unparsedLinkLines = 0;
+            for (const file of files) {
+              if (!README_FILE_RE.test(file.filename) || !file.patch) continue;
+              for (const rawLine of file.patch.split('\n')) {
+                if (!rawLine.startsWith('+')) continue;
+                const line = rawLine.slice(1);
+                const linkTargets = [...line.matchAll(LINK_TARGET_RE)].map(m => m[1]);
+                // Table-of-contents lines only link to anchors
+                if (linkTargets.length > 0 && linkTargets.every(t => t.startsWith('#')) && !/https?:\/\/|</i.test(line)) continue;
 
-            // Filter to only genuinely new entries (not already in the base README)
-            const newAddedLines = addedLines.filter(line => {
-              const ghMatch = line.match(/\(https:\/\/github\.com\/[^)]+\)/i);
-              return !ghMatch || !existingUrls.has(ghMatch[0].toLowerCase());
-            });
-
-            // Only check new entries for glama link
-            const hasGlama = newAddedLines.some(line => line.includes('glama.ai/mcp/servers/') && line.includes('/badges/score.svg'));
-
-            let hasValidEmoji = false;
-            let hasInvalidEmoji = false;
-            const invalidLines = [];
-            const badNameLines = [];
-            const duplicateUrls = [];
-            const nonGithubUrls = [];
-
-            // Check for non-GitHub URLs in added entry lines (list items with markdown links)
-            const allAddedEntryLines = files
-              .filter(f => f.patch)
-              .flatMap(f => f.patch.split('\n').filter(line => line.startsWith('+')))
-              .map(line => line.replace(/^\+/, ''))
-              .filter(line => /^\s*-\s*\[/.test(line));
-
-            for (const line of allAddedEntryLines) {
-              // Extract the primary link URL (first markdown link)
-              const linkMatch = line.match(/\]\((https?:\/\/[^)]+)\)/);
-              if (linkMatch) {
-                const url = linkMatch[1];
-                if (!url.startsWith('https://github.com/')) {
-                  nonGithubUrls.push(url);
+                const m = line.match(ENTRY_RE);
+                if (!m) {
+                  if (LINK_LIKE_RE.test(line)) unparsedLinkLines++;
+                  continue;
                 }
+
+                const [, linkText, primaryUrl, rest] = m;
+                const gh = parseGithubRepoUrl(primaryUrl);
+
+                const visibleRest = rest.replace(/<!--[\s\S]*?(-->|$)/g, '').replace(/`[^`]*`/g, '');
+                const badges = [...visibleRest.matchAll(BADGE_RE)]
+                  .map(b => parseGlamaBadge(b[1], b[2]))
+                  .filter(Boolean);
+                const matchingBadge = gh && badges.find(b => b.ownerRepo.toLowerCase() === `${gh.owner}/${gh.repo}`.toLowerCase());
+
+                const allEmojis = line.match(emojiRegex) || [];
+                const unknownEmojis = allEmojis.filter(e => !permittedEmojis.some(p => p.includes(e) || e.includes(p)));
+                const usesPermitted = permittedEmojis.some(e => line.includes(e));
+
+                entries.push({
+                  gh,
+                  primaryUrl,
+                  isExisting: Boolean(gh && existingKeys.has(gh.key)),
+                  glamaPath: matchingBadge ? matchingBadge.path : null,
+                  emojiOk: usesPermitted && unknownEmojis.length === 0,
+                  nameOk: !gh || ENTRY_NAME_RE.test(linkText.trim()),
+                });
               }
             }
-
-            // Check for duplicates
-            for (const line of addedLines) {
-              const ghMatch = line.match(/\(https:\/\/github\.com\/[^)]+\)/i);
-              if (ghMatch && existingUrls.has(ghMatch[0].toLowerCase())) {
-                duplicateUrls.push(ghMatch[0].replace(/[()]/g, ''));
-              }
+            if (unparsedLinkLines > 0) {
+              manualReviewReasons.push('Some added lines contain links but are not in the standard entry format.');
             }
 
-            for (const line of newAddedLines) {
-              const usedPermitted = permittedEmojis.filter(e => line.includes(e));
-              if (usedPermitted.length > 0) {
-                hasValidEmoji = true;
-              } else {
-                invalidLines.push(line.replace(/^\+/, '').trim());
-              }
+            const newEntries = entries.filter(e => !e.isExisting);
+            const duplicateUrls = [...new Set(entries.filter(e => e.isExisting).map(e => e.gh.url))];
+            const nonGithubUrls = entries.filter(e => !e.gh).map(e => e.primaryUrl);
+            const badNames = [...new Set(newEntries.filter(e => !e.nameOk).map(e => `${e.gh.owner}/${e.gh.repo}`))];
 
-              const emojiRegex = /\p{Emoji_Presentation}|\p{Emoji}\uFE0F/gu;
-              const allEmojis = line.match(emojiRegex) || [];
-              const unknownEmojis = allEmojis.filter(e => !permittedEmojis.some(p => p.includes(e) || e.includes(p)));
-              if (unknownEmojis.length > 0) {
-                hasInvalidEmoji = true;
-              }
-
-              const entryRegex = /\[([^\]]+)\]\(https:\/\/github\.com\/([^/]+)\/([^/)]+)\)/;
-              const match = line.match(entryRegex);
-              if (match) {
-                const linkText = match[1];
-                const expectedName = `${match[2]}/${match[3]}`;
-                if (!linkText.toLowerCase().includes('/')) {
-                  badNameLines.push({ linkText, expectedName });
-                }
-              }
-            }
-
-            const emojiOk = newAddedLines.length === 0 || (hasValidEmoji && !hasInvalidEmoji && invalidLines.length === 0);
-            const nameOk = badNameLines.length === 0;
+            const hasGlama = newEntries.length > 0 && newEntries.every(e => e.glamaPath);
+            const emojiOk = newEntries.every(e => e.emojiOk);
+            const nameOk = badNames.length === 0;
             const noDuplicates = duplicateUrls.length === 0;
             const allGithub = nonGithubUrls.length === 0;
+            const needsManualReview = manualReviewReasons.length > 0;
 
-            // Apply glama labels
-            const glamaLabel = hasGlama ? 'has-glama' : 'missing-glama';
-            const glamaLabelRemove = hasGlama ? 'missing-glama' : 'has-glama';
-
-            // Apply emoji labels
-            const emojiLabel = emojiOk ? 'has-emoji' : 'missing-emoji';
-            const emojiLabelRemove = emojiOk ? 'missing-emoji' : 'has-emoji';
-
-            // Apply name labels
-            const nameLabel = nameOk ? 'valid-name' : 'invalid-name';
-            const nameLabelRemove = nameOk ? 'invalid-name' : 'valid-name';
-
-            const labelsToAdd = [glamaLabel, emojiLabel, nameLabel];
-            const labelsToRemove = [glamaLabelRemove, emojiLabelRemove, nameLabelRemove];
-
-            if (!noDuplicates) {
-              labelsToAdd.push('duplicate');
-            } else {
-              labelsToRemove.push('duplicate');
+            // Positive labels are only granted when the whole diff could be inspected
+            const labelsToAdd = [];
+            const labelsToRemove = [];
+            for (const [ok, positive, negative] of [
+              [hasGlama, 'has-glama', 'missing-glama'],
+              [emojiOk, 'has-emoji', 'missing-emoji'],
+              [nameOk, 'valid-name', 'invalid-name'],
+            ]) {
+              if (!ok) {
+                labelsToAdd.push(negative);
+                labelsToRemove.push(positive);
+              } else if (needsManualReview) {
+                labelsToRemove.push(positive, negative);
+              } else {
+                labelsToAdd.push(positive);
+                labelsToRemove.push(negative);
+              }
             }
+            (noDuplicates ? labelsToRemove : labelsToAdd).push('duplicate');
+            (allGithub ? labelsToRemove : labelsToAdd).push('non-github-url');
+            (needsManualReview ? labelsToAdd : labelsToRemove).push('needs-manual-review');
 
-            if (!allGithub) {
-              labelsToAdd.push('non-github-url');
-            } else {
-              labelsToRemove.push('non-github-url');
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: pr_number,
+                labels: labelsToAdd,
+              });
             }
-
-            await github.rest.issues.addLabels({
-              owner,
-              repo,
-              issue_number: pr_number,
-              labels: labelsToAdd,
-            });
 
             for (const label of labelsToRemove) {
               try {
@@ -222,18 +271,41 @@ jobs:
               }
             }
 
-            // Post comments for issues, avoiding duplicates
-            const { data: comments } = await github.rest.issues.listComments({
+            // Post comments for issues, avoiding duplicates. Only markers in our own comments count.
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
               issue_number: pr_number,
               per_page: 100,
             });
+            const botComments = comments.filter(c => c.user && c.user.login === BOT_LOGIN);
+            const alreadyPosted = marker => botComments.some(c => (c.body || '').includes(marker));
+
+            // Manual review comment
+            if (needsManualReview) {
+              const marker = '<!-- manual-review-check -->';
+              if (!alreadyPosted(marker)) {
+                const reasons = manualReviewReasons.map(r => `- ${r}`).join('\n');
+                const otherFiles = [...unexpectedFiles, ...filesWithoutPatch];
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr_number,
+                  body: `${marker}\nThis PR could not be fully validated automatically and needs manual review:
+
+            ${reasons}
+            ${otherFiles.length > 0 ? `\nAffected files:\n\n${codeBlock(otherFiles.slice(0, 20))}\n` : ''}
+            Submissions should only add entries to the README files, one per line, in the format:
+
+            \`- [owner/repo](https://github.com/owner/repo) [![owner/repo MCP server](https://glama.ai/mcp/servers/owner/repo/badges/score.svg)](https://glama.ai/mcp/servers/owner/repo) 🐍 🏠 - Description.\``
+                });
+              }
+            }
 
             // Glama missing comment
             if (!hasGlama) {
               const marker = '<!-- glama-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
+              if (!alreadyPosted(marker)) {
                 await github.rest.issues.createComment({
                   owner,
                   repo,
@@ -250,7 +322,7 @@ jobs:
 
             \`[![OWNER/REPO MCP server](https://glama.ai/mcp/servers/OWNER/REPO/badges/score.svg)](https://glama.ai/mcp/servers/OWNER/REPO)\`
 
-            Replace \`OWNER/REPO\` with your server's Glama path.
+            Replace \`OWNER/REPO\` with your server's Glama path. The badge must belong to the same \`OWNER/REPO\` as the GitHub repository linked in the entry.
 
             If you need any assistance, feel free to ask questions here or on [Discord](https://glama.ai/discord).
 
@@ -259,49 +331,31 @@ jobs:
               }
             }
 
-            // Glama badge score comment — posted once the PR includes a glama link
-            if (hasGlama) {
+            // Glama badge score comment — posted once every new entry has a matching glama badge
+            if (hasGlama && !needsManualReview) {
               const marker = '<!-- glama-badge-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
-                const glamaLines = files
-                  .filter(f => f.patch)
-                  .flatMap(f => f.patch.split('\n').filter(l => l.startsWith('+')))
-                  .filter(l => l.includes('glama.ai/mcp/servers/') && l.includes('/badges/score.svg'))
-                  .filter(l => {
-                    const ghMatch = l.match(/\(https:\/\/github\.com\/[^)]+\)/i);
-                    return !ghMatch || !existingUrls.has(ghMatch[0].toLowerCase());
-                  });
-
-                let glamaServerPath = '';
-                for (const line of glamaLines) {
-                  const glamaMatch = line.match(/glama\.ai\/mcp\/servers\/([^/)\s]+\/[^/)\s]+)/);
-                  if (glamaMatch) {
-                    glamaServerPath = glamaMatch[1];
-                    break;
-                  }
-                }
-
-                if (glamaServerPath) {
-                  await github.rest.issues.createComment({
-                    owner,
-                    repo,
-                    issue_number: pr_number,
-                    body: `${marker}\nThank you for adding the Glama badge!
+              if (!alreadyPosted(marker)) {
+                const glamaServerPath = newEntries[0].glamaPath;
+                const glamaServerName = glamaServerPath.replace(/^@/, '');
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pr_number,
+                  body: `${marker}\nThank you for adding the Glama badge!
 
             Please make sure the server has been evaluated by Glama and has a [quality score](https://glama.ai/mcp/servers/${glamaServerPath}/score):
 
-            [![${glamaServerPath} MCP server](https://glama.ai/mcp/servers/${glamaServerPath}/badges/score.svg)](https://glama.ai/mcp/servers/${glamaServerPath})
+            [![${glamaServerName} MCP server](https://glama.ai/mcp/servers/${glamaServerPath}/badges/score.svg)](https://glama.ai/mcp/servers/${glamaServerPath})
 
             If you need any assistance, feel free to ask questions here or on [Discord](https://glama.ai/discord).`
-                  });
-                }
+                });
               }
             }
 
             // Emoji comment
-            if (!emojiOk && newAddedLines.length > 0) {
+            if (!emojiOk) {
               const marker = '<!-- emoji-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
+              if (!alreadyPosted(marker)) {
                 const emojiList = [
                   '🎖️ – official implementation',
                   '🐍 – Python',
@@ -337,7 +391,7 @@ jobs:
             // Duplicate comment
             if (!noDuplicates) {
               const marker = '<!-- duplicate-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
+              if (!alreadyPosted(marker)) {
                 const dupes = duplicateUrls.map(u => `- ${u}`).join('\n');
                 await github.rest.issues.createComment({
                   owner,
@@ -355,17 +409,16 @@ jobs:
             // Non-GitHub URL comment
             if (!allGithub) {
               const marker = '<!-- url-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
-                const urls = nonGithubUrls.map(u => `- ${u}`).join('\n');
+              if (!alreadyPosted(marker)) {
                 await github.rest.issues.createComment({
                   owner,
                   repo,
                   issue_number: pr_number,
-                  body: `${marker}\nWe only accept servers hosted on GitHub. The following URLs are not GitHub links:
+                  body: `${marker}\nWe only accept servers hosted on GitHub. The following entry links are not \`https://github.com/OWNER/REPO\` repository links:
 
-            ${urls}
+            ${codeBlock(nonGithubUrls.slice(0, 20))}
 
-            Remote-only server (no installable package)? It belongs in [awesome-remote-mcp-servers](https://github.com/punkpeye/awesome-remote-mcp-servers) instead. Otherwise, update your PR to use a \`https://github.com/...\` repository link.`
+            Remote-only server (no installable package)? It belongs in [awesome-remote-mcp-servers](https://github.com/punkpeye/awesome-remote-mcp-servers) instead. Otherwise, update your PR to use a \`https://github.com/OWNER/REPO\` repository link (sub-directories as \`https://github.com/OWNER/REPO/tree/BRANCH/PATH\`, without query strings or #fragments).`
                 });
               }
             }
@@ -373,16 +426,14 @@ jobs:
             // Name format comment
             if (!nameOk) {
               const marker = '<!-- name-check -->';
-              if (!comments.some(c => c.body.includes(marker))) {
-                const examples = badNameLines.map(
-                  b => `- \`${b.linkText}\` should be \`${b.expectedName}\``
-                ).join('\n');
+              if (!alreadyPosted(marker)) {
+                const examples = badNames.map(name => `- \`${name}\``).join('\n');
 
                 await github.rest.issues.createComment({
                   owner,
                   repo,
                   issue_number: pr_number,
-                  body: `${marker}\nThe entry name must use the full \`owner/repo\` format (not just the repo name).
+                  body: `${marker}\nThe entry name must use the full \`owner/repo\` format (not just the repo name). Please rename the following entries:
 
             ${examples}
 
